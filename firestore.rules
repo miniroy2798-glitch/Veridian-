@@ -1,0 +1,160 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Catch-all deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'publicKeyJwk']) 
+        && data.uid == request.auth.uid
+        && data.uid is string && data.uid.size() <= 128
+        && data.displayName is string && data.displayName.size() <= 100
+        && data.email is string && data.email.size() <= 150
+        && data.publicKeyJwk is string && data.publicKeyJwk.size() <= 2000
+        && (data.keys().hasAll(['photoURL']) ? (data.photoURL is string && data.photoURL.size() <= 3000000) : true)
+        && (data.keys().hasAll(['username']) ? (data.username is string && data.username.size() <= 50) : true)
+        && (data.keys().hasAll(['contacts']) ? data.contacts is list : true);
+    }
+    
+    // User Profiles
+    match /users/{userId} {
+      // Anyone signed in can view other public keys to start chats
+      allow read: if isSignedIn();
+      
+      allow create: if isSignedIn() 
+        && isValidId(userId)
+        && userId == request.auth.uid
+        && isValidUser(incoming());
+        
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && userId == request.auth.uid
+        && isValidUser(incoming())
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'publicKeyJwk', 'username', 'contacts']);
+    }
+
+    function isValidChat(data) {
+      return data.keys().hasAll(['participants', 'createdAt'])
+        && data.participants is list
+        && data.participants.size() >= 2
+        && data.createdAt == request.time
+        && (data.keys().hasAll(['lastMessagePreview']) ? (data.lastMessagePreview is string && data.lastMessagePreview.size() <= 500) : true)
+        && (data.keys().hasAll(['lastMessageAt']) ? data.lastMessageAt == request.time : true)
+        && (data.keys().hasAll(['isGroup']) ? data.isGroup is bool : true)
+        && (data.keys().hasAll(['name']) ? (data.name is string && data.name.size() <= 100) : true)
+        && (data.keys().hasAll(['adminId']) ? data.adminId is string : true)
+        && (data.keys().hasAll(['groupKeys']) ? data.groupKeys is map : true);
+    }
+    
+    function isChatParticipant(chatData) {
+      return request.auth.uid in chatData.participants;
+    }
+
+    // Chats
+    match /chats/{chatId} {
+      allow read: if isSignedIn() && isChatParticipant(existing());
+      
+      allow create: if isSignedIn()
+        && isValidId(chatId)
+        && isValidChat(incoming())
+        && isChatParticipant(incoming());
+        
+      allow update: if isSignedIn()
+        && isChatParticipant(existing())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['lastMessagePreview', 'lastMessageAt', 'participants', 'groupKeys', 'name']);
+    }
+
+    function isValidMessage(data) {
+       return data.keys().hasAll(['senderId', 'ciphertext', 'iv', 'createdAt'])
+        && data.senderId == request.auth.uid
+        && data.senderId is string && data.senderId.size() <= 128
+        && data.ciphertext is string && data.ciphertext.size() <= 1048000 // up to ~1MB encrypted
+        && data.iv is string && data.iv.size() <= 100
+        && data.createdAt == request.time
+        && (data.keys().hasAll(['mediaType']) ? (data.mediaType is string && data.mediaType.size() <= 100) : true)
+        && (data.keys().hasAll(['fileName']) ? (data.fileName is string && data.fileName.size() <= 200) : true)
+        && (data.keys().hasAll(['fileSize']) ? data.fileSize is number : true);
+    }
+
+    // Chat Messages
+    match /chats/{chatId}/messages/{messageId} {
+      allow read: if isSignedIn() 
+        && isChatParticipant(get(/databases/$(database)/documents/chats/$(chatId)).data);
+        
+      allow create: if isSignedIn()
+        && isValidId(chatId)
+        && isValidId(messageId)
+        && isChatParticipant(get(/databases/$(database)/documents/chats/$(chatId)).data)
+        && isValidMessage(incoming());
+        
+      // No msg updates
+      allow update: if false;
+    }
+
+    function isValidCall(data) {
+      return data.keys().hasAll(['callerId', 'calleeId', 'createdAt'])
+        && data.callerId is string && data.callerId.size() <= 128
+        && data.calleeId is string && data.calleeId.size() <= 128
+        && data.createdAt == request.time
+        && (data.keys().hasAll(['offer']) ? data.offer is string && data.offer.size() <= 10000 : true)
+        && (data.keys().hasAll(['answer']) ? data.answer is string && data.answer.size() <= 10000 : true)
+        && (data.keys().hasAll(['status']) ? data.status is string && data.status.size() <= 20 : true);
+    }
+    
+    function isCallParticipant(data) {
+      return request.auth.uid == data.callerId || request.auth.uid == data.calleeId;
+    }
+
+    // WebRTC Calls
+    match /calls/{callId} {
+      allow read: if isSignedIn() && isCallParticipant(existing());
+      
+      allow create: if isSignedIn()
+        && isValidId(callId)
+        && isValidCall(incoming())
+        && incoming().callerId == request.auth.uid;
+        
+      allow update: if isSignedIn()
+        && isCallParticipant(existing())
+        && incoming().callerId == existing().callerId
+        && incoming().calleeId == existing().calleeId
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'offer', 'answer']);
+    }
+    
+    function isValidIceCandidate(data) {
+      return data.keys().hasAll(['candidate'])
+        && data.candidate is string && data.candidate.size() <= 5000;
+    }
+
+    match /calls/{callId}/callerCandidates/{candidateId} {
+      allow read: if isSignedIn() && isCallParticipant(get(/databases/$(database)/documents/calls/$(callId)).data);
+      allow create: if isSignedIn()
+        && get(/databases/$(database)/documents/calls/$(callId)).data.callerId == request.auth.uid
+        && isValidIceCandidate(incoming());
+    }
+
+    match /calls/{callId}/calleeCandidates/{candidateId} {
+      allow read: if isSignedIn() && isCallParticipant(get(/databases/$(database)/documents/calls/$(callId)).data);
+      allow create: if isSignedIn()
+        && get(/databases/$(database)/documents/calls/$(callId)).data.calleeId == request.auth.uid
+        && isValidIceCandidate(incoming());
+    }
+  }
+}

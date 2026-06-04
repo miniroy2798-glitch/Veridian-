@@ -1,0 +1,6 @@
+{
+  "name": "SecureChat",
+  "description": "E2EE Chat and WebRTC Video Calls",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
